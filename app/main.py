@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
-from . import config, db, processing
+from . import config, db, processing, quarantine_inspect
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -135,7 +135,9 @@ app = FastAPI(
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically. A published lane's quarantine "
+        "bucket can be inspected for the exact top-20 R1+R2 8-base index "
+        "combinations, with suspected cross-sample combinations flagged."
     ),
     lifespan=lifespan,
 )
@@ -320,6 +322,48 @@ def download_quarantine(lane: str, mate: str):
     return FileResponse(
         path, media_type="application/gzip",
         filename=f"{lane}.quarantine.{mate}.fastq.gz")
+
+
+@app.post("/lanes/{lane}/quarantine/inspect")
+def inspect_quarantine(lane: str):
+    """Inspect a published lane's quarantine read pairs.
+
+    Re-validates the published quarantine R1/R2 files (read names, FASTQ
+    format, gzip integrity, pairing), builds the 16-base index from the
+    first 8 bases of each mate and exactly counts index combinations.
+    Returns the top 20 combinations (ties broken by index, ascending) and
+    the total quarantine pair count. Pairs whose index is shorter than 8
+    bases or contains N in the first 8 bases are counted separately and
+    never ranked. A combination whose two ends each uniquely and exactly
+    match the R1/R2 barcode of *different* samples of this lane is flagged
+    as suspected cross-sample contamination.
+
+    The check is read-only (published files are never modified) and
+    all-or-nothing: missing files, corrupt gzip, unpaired mates or
+    over-limit lines fail the whole check with no partial statistics.
+    Per-record limits: read name <= 256 bytes, sequence and quality lines
+    <= 1000 bytes each.
+    """
+    conn = db.get_conn()
+    pub = conn.execute(
+        "SELECT * FROM lane_publishes WHERE lane=?", (lane,)).fetchone()
+    if pub is None:
+        raise HTTPException(404, "lane not published (or unknown)")
+    row = conn.execute(
+        "SELECT * FROM lane_counts WHERE lane=? AND sample_id=?",
+        (lane, processing.QUARANTINE)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"quarantine bucket not found in lane {lane}")
+    samples = [dict(s) for s in db.get_samples(pub["job_id"])]
+    try:
+        result = quarantine_inspect.inspect_lane_quarantine(
+            lane, Path(row["r1_file"]), Path(row["r2_file"]), samples)
+    except quarantine_inspect.MissingDataError as exc:
+        raise HTTPException(409, str(exc))
+    except quarantine_inspect.InspectError as exc:
+        raise HTTPException(422, str(exc))
+    result["published_pairs"] = row["read_pairs"]
+    return result
 
 
 # ---------------- snapshots ----------------

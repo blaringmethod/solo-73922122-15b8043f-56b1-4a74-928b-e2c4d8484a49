@@ -7,7 +7,9 @@ Simulates the docker-compose deployment:
     and query/download stay responsive;
   * jobs are claimed by exactly one instance each and work is shared;
   * duplicate submissions reuse the task, conflicting input is rejected;
-  * snapshots fix the published lane set.
+  * snapshots fix the published lane set;
+  * quarantine inspection returns exact top combinations from either
+    instance without modifying published files.
 
 Hard-crash recovery (SIGKILL mid-lane) is covered by the pytest suite
 (tests/test_failure_and_recovery.py) because some sandboxes forbid kill().
@@ -221,16 +223,41 @@ def main() -> int:
         boundary, body = multipart("laneIT0", bad_barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 409, (code, resp)
+
+        print("[6] quarantine inspect: exact counts, read-only, both instances")
+        # The demo fixture quarantines exactly 2 pairs: a 2-substitution read
+        # (ranked index AAAAAATT+CCCCCCCG) and an N-bearing read (unranked).
+        code, resp = http("POST", f"{BASE_B}/lanes/laneIT0/quarantine/inspect")
+        assert code == 200, (code, resp)
+        info = json.loads(resp)
+        assert info["total_pairs"] == 2, info
+        assert info["ranked_pairs"] == 1 and info["unranked_pairs"] == 1
+        assert [(t["index"], t["pairs"]) for t in info["top"]] == [
+            ("AAAAAATTCCCCCCCG", 1)]
+        assert info["suspected_cross_samples"] == []
+        # Same result from the other instance; published files untouched.
+        code, resp = http("POST", f"{BASE_A}/lanes/laneIT0/quarantine/inspect")
+        assert code == 200 and json.loads(resp)["total_pairs"] == 2
+        code, lane = http("GET", f"{BASE_A}/lanes/laneIT0")
+        counts = {c["sample_id"]: c["read_pairs"]
+                  for c in json.loads(lane)["counts"]}
+        assert counts["__quarantine__"] == 2
+        # Unknown lane -> 404; OpenAPI docs reachable on both instances.
+        code, _ = http("POST", f"{BASE_A}/lanes/ghostLane/quarantine/inspect")
+        assert code == 404
+        for base in (BASE_A, BASE_B):
+            code, body = http("GET", base + "/docs")
+            assert code == 200 and b"swagger" in body.lower()
     finally:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[7] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[7] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)

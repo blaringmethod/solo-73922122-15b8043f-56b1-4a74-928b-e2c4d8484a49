@@ -27,6 +27,20 @@ volume** with a **128 MiB memory limit**.
 * Snapshots freeze the published lane list at creation time. Sample/
   quarantine downloads through a snapshot only ever concatenate files from
   that fixed list — lanes published later never mix in.
+* A published lane's quarantine bucket can be **inspected** on demand
+  (`POST /lanes/{lane}/quarantine/inspect`): the published R1/R2 files are
+  re-validated (read names, FASTQ format, gzip integrity, pairing), the
+  first 8 bases of each mate are concatenated into a 16-base index, and
+  index combinations are counted **exactly** per read pair. The response
+  carries the top 20 combinations (ties broken by index, ascending), the
+  total quarantine pair count, and flags combinations whose two ends each
+  uniquely and exactly match the R1/R2 barcode of *different* samples of
+  the lane (suspected cross-sample contamination). Pairs with an index
+  shorter than 8 bases or with N in the first 8 bases are counted
+  separately and never ranked. The check is read-only and all-or-nothing:
+  missing files, corrupt gzip, unpaired mates or over-limit lines
+  (read name > 256 bytes, sequence/quality line > 1000 bytes) fail the
+  whole check with no partial statistics, and scratch data is cleaned up.
 
 ## Running (Docker Compose, two instances on a shared volume)
 
@@ -63,6 +77,7 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
 | GET | `/lanes`, `/lanes/{lane}` | Published lanes and per-bucket counts |
 | GET | `/lanes/{lane}/samples/{sample_id}/{r1\|r2}` | Download a sample mate |
 | GET | `/lanes/{lane}/quarantine/{r1\|r2}` | Download a quarantine mate |
+| POST | `/lanes/{lane}/quarantine/inspect` | Exact top-20 index combinations in quarantine |
 | POST | `/snapshots` | Freeze the current published lane list |
 | GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots |
 | GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download |
@@ -91,13 +106,22 @@ reads, one open gzip writer per bucket). No file is ever buffered whole.
 The automated streaming test processes hundreds of MiB of decompressed
 data with RSS growth below 64 MiB.
 
+Quarantine inspection keeps the same profile: line reads are windowed
+(over-limit lines are rejected, never buffered), each 16-base index packs
+into 4 bytes, and indices are hash-spilled to 256 scratch partition files
+under `work/inspect-<uuid>/` (flock-protected from startup recovery,
+always deleted afterwards). Partitions are counted one at a time, so exact
+top-20 counting stays bounded even for a 512 MiB lane of distinct indices.
+
 ## Layout
 
 ```
-app/            FastAPI app, SQLite layer, streaming splitter, worker
+app/            FastAPI app, SQLite layer, streaming splitter, worker,
+                quarantine inspector
 scripts/        demo FASTQ generator, two-instance integration check
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, quarantine
+                inspection)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```
